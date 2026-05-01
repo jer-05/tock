@@ -2,20 +2,42 @@ from random import choice
 import numpy as np 
 import torch 
 from torch import nn 
+import torch.onnx
+import onnxruntime as ort
+import time
 import os
 import traceback
 import sys
+from contextlib import redirect_stderr
+import multiprocessing
+from tqdm import tqdm
+
 
 from tock import make, PLACES_PER_SEGMENT, RANKS, DEAL_ORDER, AVERAGE_GAME_LENGTH
+from fasttock import FastTockGame, CARD_TO_REPR, action_tuple_to_action_number, tupled_action_space_to_action_mask
+
 
 device = torch.device("cuda") if torch.cuda.is_available() else 'cpu'
 
-def getstate(obs, info, gettorch = False, unsqueeze = True): 
+def getstate(unsorted_obs, info, gettorch = False, unsqueeze = True, getdict = False, fastgame_type=True): 
     """
     Get the game state representation
     """
     current_player = info['player'] 
+    # print("unsorted: ", unsorted_obs)
+    if fastgame_type:
+        obs = unsorted_obs
+    else:
+        obs = [sorted(unsorted_obs[i]) for i in range(len(unsorted_obs))]
+    # print("sorted: ", obs)
     nplayer = len(obs) 
+    for player in range(nplayer):
+        old = -np.inf
+        for ob in obs[player]:
+            if ob < old:
+                print(f"getstate: obs should be supplied in the ordered FastTockGame format")
+                breakpoint()
+            old = ob
     nfields = nplayer * PLACES_PER_SEGMENT 
     offsets = [PLACES_PER_SEGMENT * ((i - current_player) % nplayer)\
             for i in range(nplayer)]
@@ -41,6 +63,9 @@ def getstate(obs, info, gettorch = False, unsqueeze = True):
                 abs_loc = (loc - 1 + offsets[player]) % nfields
                 field[shifted_player + channel_offset][abs_loc] = 1 
 
+    # print(f"Saved locs:")
+    # print(field_start_base_to_obs(field, start, base))
+
     # prepare other relevant information, such as cards, round and action mask
     cards = np.zeros(13)
     for card in info['cards']:
@@ -54,20 +79,141 @@ def getstate(obs, info, gettorch = False, unsqueeze = True):
         folded = 1
     else:
         folded = 0
-    action_mask = np.zeros(52)
-    for action in info['space']:
-        cardidx, pawn = action
-        card = info['cards'][cardidx] % 13
-        action_number = 4 * card + pawn
-        action_mask[action_number] = 1
+    if fastgame_type:
+        action_mask = info['space']
+    else:
+        action_mask = tupled_action_space_to_action_mask(info['space'], unsorted_obs[current_player], info['cards'])
+    if getdict:
+        state = {}
+        state['field'] = field[None, :].astype(np.float32)
+        state['start'] = start[None, :].astype(np.float32)
+        state['base'] = base[None, :].astype(np.float32)
+        state['card'] = cards[None, :].astype(np.float32)
+        state['fold'] = np.array([[folded]], dtype=np.float32)
+        state['roundn'] = np.array([[roundn]], dtype=np.float32)
+        state['player'] = np.array([[current_player]], dtype=np.float32)
+        state['action_mask'] = action_mask[None, :].astype(np.float32)
+        return state
     if not gettorch:
         return field, start, base, cards, folded, roundn, current_player, action_mask
     elif gettorch:
         return totorch((field, start, base, cards, folded, roundn, current_player, action_mask), unsqueeze=unsqueeze)
 
-         
+def print_block(s):
+    slen = len(s)
+    print("=" * (slen + 4))
+    print(f"| {s} |")
+    print("=" * (slen + 4))
+
+def print_v(s):
+    slen = len(s)
+    print("v" * (slen + 4))
+    print(f"| {s} |")
+    print("^" * (slen + 4))
+
+def print_important(s):
+    slen = len(s)
+    print(f"[!]: {s}")
+
+
+def check_abortion(stopevent, reset=False, extra_stop_event=None):
+    start = time.time()
+    tqdm.write(f"Put 'stop' in stopevent.txt to abort")
+    if reset:
+        with open("stopevent.txt", "w") as f:
+            f.write('running')
+    while not stopevent.is_set():
+        try:
+            with open("stopevent.txt", "r") as f:
+                if f.read().strip() == "stop":
+                    tqdm.write(f"\n[!]: Abort signal received from file!")
+                    if extra_stop_event is not None:
+                        extra_stop_event.set()
+                    stopevent.set()
+        except Exception as e:
+            pass
+        # print(f"Abortion checker with pid {os.getpid()} is still alive, running for {time.time() - start:.0f} seconds")
+        time.sleep(2)
+    if reset:
+        with open("stopevent.txt", "w") as f:
+            f.write('stopped')
+
+ort_options = ort.SessionOptions()
+ort_options.intra_op_num_threads = 1
+ort_options.inter_op_num_threads = 1
+
+ONNX_WEIGHTS_DIR = "weights/onnx"
+
+def get_ort_inference_session(model, mfname, pid, currently_exporting_arr, export_lock, exported_models_cache, verbose=False):
+    session_hash = tuple([mfname, os.path.getmtime(mfname), pid])
+    export_hash = tuple([mfname, os.path.getmtime(mfname)])
+    c = False
+    while True:
+        with export_lock:
+            if export_hash not in currently_exporting_arr:
+                currently_exporting_arr[export_hash] = True
+                break
+        if verbose:
+            if c == False:
+                print(f"[{pid}]: waiting for export ...")
+                c = True
+        time.sleep(.1)
+
+    with export_lock:
+        cached = export_hash in exported_models_cache
+            
+    if cached:
+        fname = exported_models_cache[export_hash]
+        if verbose:
+            print(f"[{pid}]: Retrieving exported model from cache")
+    else:
+        if verbose:
+            print(f"[{pid}]: Export hash {export_hash} not yet in cache ... exporting ...")
+        model.eval()
+        nplayers = model.nplayers
+        game = FastTockGame(nplayers)
+        obs, done, rew, info = game._get_gamestate()
+        state = getstate(obs, info, gettorch=True, unsqueeze=True)
+        i = 0
+        while True:
+            fname = f"{ONNX_WEIGHTS_DIR}/model_pid{pid}_i{i}.onnx"
+            if not os.path.isfile(fname):
+                if verbose:
+                    print(f"[{pid}]: Exporting ONNX model from fname {mfname}!")
+                with redirect_stderr(open("/dev/null", "w")):
+                    torch.onnx.export(model, tuple(state), fname, verbose=False, input_names=["field", "start", "base", "card", "fold", "roundn", "player", "action_mask"])
+                with export_lock:
+                    if verbose:
+                        print(f"[{pid}]: Saving to exported models cache w/ hash {export_hash}")
+                    exported_models_cache[export_hash] = fname
+                break
+            i += 1
+    sess = ort.InferenceSession(fname, providers=['CPUExecutionProvider'], sess_options = ort_options)
+    # print(f"Cached ONNX Runtime session successfully")
+    with export_lock:
+        currently_exporting_arr.pop(export_hash)
+    return sess
+
+import random
 def clean_fname(fname):
-    return fname.replace(":", "-").replace("{", "_").replace("}","_").replace("'","").replace('"',"").replace('/','-').replace(" ","")
+    cleant_fname = fname.replace(":", "-").replace("{", "_").replace("}","_").replace("'","").replace('"',"").replace('/','-').replace(" ","").replace(",","").replace("?","")
+    need_remove_ratio = 1 - 100/len(cleant_fname)
+    i = 0
+    while True:
+        if i >= len(cleant_fname) - 5:
+            i = 0
+        if len(cleant_fname) < 100:
+            break
+        cleant_fname = cleant_fname.replace("-","").replace("_","")
+        c = cleant_fname[i]
+        if c.isalpha() and random.random() < need_remove_ratio:
+            if i == len(cleant_fname) -1:
+                cleant_fname = cleant_fname[:i]
+            else:
+                cleant_fname = cleant_fname[:i] + cleant_fname[i+1:]
+        else:
+            i += 1
+    return cleant_fname
 
 def remove_dirs(fname):
     if "." in fname:
@@ -91,43 +237,10 @@ def checkfn(fname):
         os.system(f"mv '{fname}' '{new_fname}'")
         print(f"File '{fname}' exists, moved old to '{new_fname}'")
 
-def get_idx(card, pawn, cards):
-    return (cards[card] % 13)* 4 + pawn
-
-def print_evals_and_info(info, evals, gamestr, return_string=False, twoD_eval=False, hyphens=True):
-    if not twoD_eval:
-        assert len(evals) == len(info['space'])
-        eval_order = np.argsort(evals)[::-1]
-        ordered_evals = evals[eval_order]
-    else:
-        assert len(evals[0]) == len(info['space'])
-        eval_order = np.argsort(evals[0])[::-1]
-        ordered_evals = evals[:, eval_order]
-    current_player = info['player']
-    nactions = len(info['space'])
-    action_ranking = [info['space'][eval_order[i]] for i in range(nactions)]
-    action_str = ""
-    for i in range(nactions):
-        action = get_action_string(action_ranking[i], info['cards'])
-        if not twoD_eval:
-            action_str += f"    {action}  => {ordered_evals[i]:.3f}\n"
-        else:
-            action_str += f"    {action}  => {ordered_evals[0][i]:.3f},  {ordered_evals[1][i]:.3f}\n"
-
-    action_str = action_str[:-1]
-    if return_string:
-        return gamestr + action_str
-    if hyphens:
-        print("------------------")
-    print(gamestr)
-    print(action_str)
-    if hyphens:
-        print("------------------")
-
 def get_action_string(action, cards):
     card_idx, pawn = action
     card = cards[card_idx] % 13
-    card_name = RANKS[card]
+    card_name = CARD_TO_REPR[card]
     card_str = f"({card_name}, {pawn})"
     return card_str
 
@@ -145,191 +258,8 @@ def get_obs_str(obs, player):
     rotated_obs = [obs[i - player] for i in range(len(obs))]
     s = ""
     for i, obsi in enumerate(rotated_obs):
-        s += f"P{i}: {obsi}\n"
+        s += f"P{i}: {', '.join(f'{ob:.0f}' for ob in obsi)}\n"
     return s
-
-    
-    
-def get_unique_actions(action_space, cards):
-    unique_mask = np.ones(len(cards))
-    visited_cards = []
-    for card_idx, card in enumerate(cards):
-        card = card % 13
-        if card in visited_cards:
-            unique_mask[card_idx] = 0
-        else:
-            visited_cards.append(card)
-    unique_space = []
-    for action in action_space:
-        card_idx = action[0]
-        if not unique_mask[card_idx]:
-            continue
-        unique_space.append(action)
-    return unique_space
-
-def deuniqueify_prob(action_space, cards, unique_prob):
-    unique_actions = get_unique_actions(action_space, cards)
-    non_unique_prob = np.zeros(len(action_space))
-    for i, unique_action in enumerate(unique_actions):
-        t_unique_action = (cards[unique_action[0]] % 13, unique_action[1])
-        saved_indices = []
-        for j, action in enumerate(action_space):
-            t_action = (cards[action[0]] % 13, action[1])
-            if t_unique_action == t_action:
-                non_unique_prob[j] = unique_prob[i]
-                saved_indices.append(j)
-        for idx in saved_indices:
-            non_unique_prob[idx] /= len(saved_indices)
-    return non_unique_prob
-
-def get_action_prob(prob, info, return_mask=False):
-    try:
-        mask = np.zeros(52)
-        idx_order = []
-        action_prob = np.zeros(len(info['space']))
-        for i, action in enumerate(info['space']):
-            idx = get_idx(*action, info['cards'])
-            action_prob[i] = prob[idx]
-            mask[idx] = 1
-            idx_order.append(idx)
-        idx_order = np.array(idx_order)
-        action_prob = action_prob / np.sum(action_prob)
-        one = np.sum(action_prob)
-        if not np.isclose(one, 1):
-            print(f"Error: Sum of reverted prob. should be 1 but is {one}")
-            print(f"prob: {prob}")
-            print(f"info: {info}")
-            breakpoint()
-        if return_mask:
-            assert sum(mask) == len(action_prob)
-            idx_order = np.argsort(idx_order)
-            return action_prob, mask.astype(bool), np.argsort(idx_order)
-        return action_prob
-    except:
-        traceback.print_exc()
-        breakpoint()
-
-def get_action_from_idx(idx, cards):
-    assert (idx >= 0 and idx < 52)
-    card = idx // 4
-    cardidx = -1
-    for offset in [0, 13, 26, 39]:
-        offsetted_card = card + offset
-        if offsetted_card in cards:
-            cardidx = cards.index(offsetted_card)
-            break
-    pawn = idx % 4
-    card_name = RANKS[card]
-    return (cardidx, pawn), (card_name, pawn)
-
-def policy_to_actions(policy_head, cards):
-    list_order = np.argsort(policy_head)[::-1]
-    actions = []
-    print_actions = []
-    for i in range(52):
-        action, print_action = get_action_from_idx(list_order[i], cards)
-        actions.append(action)
-        print_actions.append(print_action)
-    return actions, print_actions
-
-
-def revert_action_prob(action_prob, info):
-    assert len(action_prob) == len(info['space']), f"Incorrect amount of probabilities supplied, {len(action_prob)} vs. {len(info['space'])}"
-    prob = np.zeros(13*4)
-    for i, action in enumerate(info['space']):
-        prob[get_idx(*action, info['cards'])] += action_prob[i]
-    one = np.sum(prob)
-    if not np.isclose(one, 1):
-        print(f"Error: Sum of reverted prob. should be 1 but is {one}")
-        breakpoint()
-    return prob
-
-
-
-class PolicyNN(nn.Module):
-    def __init__(self, nplayers = 2):
-        super().__init__()
-        self.nplayers = nplayers
-        ker1 = 7
-        ch1 = 64
-        ker2 = 3
-        ch2 = 128
-        lin1 = 256
-        lin2 = 300
-        spat_in = nplayers * 16
-        spat_out = int((spat_in / 2 - ker2 + 1) / 2)
-        info_in = 2 * (nplayers + 3) + 13 + 5
-        p_drop = 0.3
-
-        assert ker1 % 2 == 1
-        self.spatial = nn.Sequential(
-                nn.Conv1d(3 + nplayers, ch1, ker1, padding=ker1//2, padding_mode = 'circular'),
-                nn.BatchNorm1d(ch1),
-                nn.ReLU(),
-                nn.MaxPool1d(2),
-                nn.Conv1d(ch1, ch2, ker2),
-                nn.BatchNorm1d(ch2),
-                nn.ReLU(),
-                nn.MaxPool1d(2),
-                nn.Dropout(p=p_drop),
-                )
-        self.linear1 = nn.Sequential(
-                nn.Linear(info_in, lin1),
-                nn.ReLU(),
-                nn.Dropout(p=p_drop)
-                )
-        self.linear2 = nn.Sequential(
-                nn.Linear(ch2 * spat_out + lin1, lin2),
-                nn.ReLU(),
-                nn.Dropout(p=p_drop),
-                )
-        self.policy_head = nn.Sequential(
-                nn.Linear(lin2, 52),
-                )
-        self.value_head = nn.Sequential(
-                nn.Linear(lin2, 1),
-                nn.Tanh(),
-                )
-        self.dropout = nn.Dropout(p=0.3)
-        self.softmax = nn.Softmax(dim=-1)
-        self.p_loss = nn.CrossEntropyLoss()
-        self.v_loss = nn.MSELoss()
-    def forward(self, field, start, base, card, fold, roundn, player):
-        try:
-            round_mod_norm = (roundn % 3) / 3
-            roundn_norm = roundn / (AVERAGE_GAME_LENGTH / (sum(DEAL_ORDER) / len(DEAL_ORDER)))
-            player_norm = player / self.nplayers
-            ncard = torch.sum(card, dim=1).unsqueeze(1)
-            ncard_norm = ncard / max(DEAL_ORDER)
-            card_norm = card / self.nplayers
-            spatial = self.spatial(field)
-            fold_norm = fold / 3
-
-            flat = torch.cat((start, base, card_norm, fold_norm, roundn_norm, round_mod_norm, player_norm, ncard_norm), dim=1)
-            linear1 = self.linear1(flat)
-            in2 = torch.cat((spatial.view(spatial.size(0), -1), linear1), dim=1)
-            linear2 = self.dropout(self.linear2(self.dropout(in2)))
-            policy_head = self.policy_head(linear2)
-            value_head = self.value_head(linear2)
-            return policy_head, value_head
-        except Exception as e:
-            print(f"Error: {e}")
-            print(f"Field: {field.shape}")
-            print(f"Start: {start.shape}")
-            print(f"Base: {base.shape}")
-            print(f"Card: {card.shape}")
-            print(f"Fold: {fold.shape}")
-            print(f"Roundn: {roundn.shape}")
-            print(f"Player: {player.shape}")
-            breakpoint()
-    def load(self, fname):
-        print(f"Loading model weights from {fname}")
-        weights = torch.load(fname)
-        self.load_state_dict(weights)
-    def save(self, fname):
-        print(f"Saving model weights as {fname}")
-        torch.save(self.state_dict(), fname)
-
 
 def totorch(arrs, dtype = torch.float32, unsqueeze=False, device='cpu'):
     converted_arrs = []
@@ -341,26 +271,6 @@ def totorch(arrs, dtype = torch.float32, unsqueeze=False, device='cpu'):
     if unsqueeze:
         converted_arrs = [tensor.unsqueeze(0) for tensor in converted_arrs]
     return converted_arrs
-
-# def totf(arrs, dtype=tf.float32, unsqueeze=False):
-#     converted_arrs = []
-#
-#     for arr in arrs:
-#         # Check if it's a numpy array or already a tensor
-#         if isinstance(arr, (np.ndarray, list)):
-#             tensor = tf.convert_to_tensor(arr)
-#             converted_arrs.append(tf.cast(tensor, dtype))
-#
-#         elif np.isscalar(arr):
-#             # Create a 1D tensor from a scalar
-#             tensor = tf.constant([arr])
-#             converted_arrs.append(tf.cast(tensor, dtype))
-#
-#     if unsqueeze:
-#         # tf.expand_dims(x, 0) is the equivalent of torch.unsqueeze(x, 0)
-#         converted_arrs = [tf.expand_dims(tensor, axis=0) for tensor in converted_arrs]
-#
-#     return converted_arrs
 
 def field_start_base_to_obs(field, start, base):
     nplayer = len(field) - 3
@@ -391,7 +301,8 @@ def field_start_base_to_obs(field, start, base):
             for field_loc in field_locs:
                 pawn_locs[player, idx] = (field_loc - player_offset) % board_len+ 1
                 idx += 1
-    return pawn_locs
+    pawn_locs = list(pawn_locs)
+    return [sorted(pawn_locs[i]) for i in range(nplayer)]
 
 
 
@@ -441,7 +352,11 @@ def test_representation():
 
 
 def main():
-    test_representation()
+    s = "hello guys"
+    print_block(s)
+    print_v(s)
+    print_important(s)
+    # test_representation()
     
 if __name__ == '__main__':
     main()

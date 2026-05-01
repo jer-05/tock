@@ -410,7 +410,10 @@ class TockGame:
         s += '         Current Game State            \n'
         s += '=======================================\n'
         for id, player in enumerate(self.players):
-            s += f'Player:{id} | ' + player.__repr__() + '\n'
+            if id == self.players.index(self.current_player):
+                s += f"\033[1mPlayer:{id} | {player.__repr__()} (current)\033[0m\n"
+            else:
+                s += f"Player:{id} | {player.__repr__()}\n"
         s += '=======================================\n'    
         return s    
 

@@ -7,10 +7,9 @@ import os
 from tqdm import tqdm
 import torch.multiprocessing as mp
 import queue
-import copy
 
 from tock import make
-from fasttock import action_tuple_to_action_number, action_number_to_action_tuples, tupled_action_space_to_action_mask, AVERAGE_GAME_LENGTHS
+from fasttock import action_tuple_to_action_number, action_number_to_action_tuples, tupled_action_space_to_action_mask
 from players import get_players, get_fname, clip_cfg
 from network import PolicyNN
 from utils import getstate, checkfn, check_abortion
@@ -32,7 +31,7 @@ def _play_and_gen_data(args):
     try:
         torch.set_num_threads(1)
         torch.set_num_interop_threads(1)
-        player_names, player_configs, ngames, nsamples, playparam, pid, results_queue, stopevent, ort_info = args
+        player_names, player_configs, ngames, playparam, pid, results_queue, stopevent, ort_info = args
         e_threads = list(range(4, 32))
         os.sched_setaffinity(0, set(e_threads))
         return_types = []
@@ -47,16 +46,10 @@ def _play_and_gen_data(args):
                 return_types.append('unique_probabilities')
             else:
                 assert False, f"Invalid return type {cfg['return_type']}"
-        if pid == 0:
-            tqdm.write(f"_play_and_gen_data: Using player return types: {', '.join(f'{name}: {return_type}' for name, return_type in zip(player_names, return_types))}")
+        # tqdm.write(f"Using player return types: {return_types}")
 
-        tau, best_play_move, alpha_best_play, include_move_fraction = playparam["tau"], playparam["best_play_move"], playparam["alpha_best_play"], playparam["include_move_fraction"]
+        tau, best_play_move = playparam["tau"], playparam["best_play_move"]
         nplayers = len(player_names)
-        av_gl = AVERAGE_GAME_LENGTHS[str(nplayers)]
-        pmax = min(1, 2 * include_move_fraction)
-        def add_sample(move):
-            return random.random() < min(pmax, move/av_gl * pmax)
-
         def _offs_arr(arr, offs):
             return [arr[(i + offs) % len(arr)] for i in range(len(arr))]
         players, types = get_players(_offs_arr(player_names, pid), _offs_arr(player_configs, pid))
@@ -77,7 +70,7 @@ def _play_and_gen_data(args):
             if return_type == "best_action":
                 move_str = "best_action"
             elif return_type == "unique_probabilities":
-                move_str = f"prob_bpmove_{best_play_move:.0f}_tau_{tau:.1f}_alpha_{alpha_best_play}"
+                move_str = f"prob_bpmove_{best_play_move:.0f}_tau_{tau:.1f}"
             player_name = f"{name}_{move_str}{idstr}"
             _player_names.append(player_name)
         player_names = _player_names
@@ -91,17 +84,13 @@ def _play_and_gen_data(args):
         checkpoint = max(1, ngames // 10)
         start_interval = time.time()
         interval_ngames = 0
-        game = 0
-        sample = 0
-        while game < ngames or sample < nsamples:
+        for game in range(ngames):
             prob_list = []
             pos_list = []
             player_list = []
             names_list=[]
-            move_list=[]
             obs, rew, done, info = env.reset()
             move = 0
-            game_samples = 0
 
             while not done:
                 player_idx = (info['player'] + game) % nplayers
@@ -120,7 +109,6 @@ def _play_and_gen_data(args):
                 if return_types[player_idx] == 'unique_probabilities':
                     masked_action_prob, action_numbers = res
                     action_prob[action_numbers] = masked_action_prob
-                    # tqdm.write(f"action_prob: {action_prob}")
                     if move >= best_play_move:
                         action_number = action_numbers[np.argmax(masked_action_prob)]
                     else:
@@ -131,10 +119,6 @@ def _play_and_gen_data(args):
                     action = (fastgame_action[0], argorder[fastgame_action[1]])
                     # tqdm.write(f"Got action_prob {action_prob}")
                     # tqdm.write(f"Choosing action {action}")
-                    best_idx = np.argmax(action_prob)
-                    action_prob *= (1 - alpha_best_play)
-                    action_prob[best_idx] += alpha_best_play
-                    # tqdm.write(f"action_prob w/ alpha: {action_prob}") 
                 elif return_types[player_idx] == 'best_action':
                     action = res
                     action_prob = tupled_action_space_to_action_mask([action], obs[info['player']], info['cards']).astype(float)
@@ -146,33 +130,30 @@ def _play_and_gen_data(args):
                     print(f"names: {names}")
                     print(f"return type: {return_types[player_idx]}")
                     breakpoint()
-
-                old_info = copy.deepcopy(info)
-                old_obs = copy.deepcopy(obs)
-                obs, rew, done, info = env.step(action=action)
-                if add_sample(move) or done:
-                    prob_list.append(action_prob)
-                    state = getstate(old_obs, old_info, fastgame_type=False)
-                    pos_list.append(state)
-                    player_list.append(old_info['player'])
-                    names_list.append(names)
-                    move_list.append(move)
-                    sample += 1
-                    game_samples += 1
-                move += 1
+                prob_list.append(action_prob)
+                state = getstate(obs, info, fastgame_type=False)
+                pos_list.append(state)
+                player_list.append(info['player'])
+                names_list.append(names)
+                # print(f"Appended data to queue:")
+                # print(f"  action_prob: {action_prob}")
+                # print(f"  names      : {names}", flush=True)
                 
+                obs, rew, done, info = env.step(action=action)
+                move += 1
             winner = info['winner']
             if nplayers == 2:
-                value_targets = [1 if winner == player_list[i] else -1 for i in range(game_samples)]
+                value_targets = [1 if winner == player_list[i] else -1 for i in range(move)]
             else:
-                value_targets = [np.array([1 if winner == (i + player_list[j]) % nplayers else 0 for i in range(nplayers)]) for j in range(game_samples)]
+                value_targets = [np.array([1 if winner == (i + player_list[j]) % nplayers else 0 for i in range(nplayers)]) for j in range(move)]
 
             interval_ngames += 1
             prob_list_total += prob_list
             pos_list_total += pos_list
             value_targets_total += value_targets
-            game_lengths_arr = [move_list[-1]] * game_samples
-            moves_total += move_list
+            moves_arr = list(range(move))
+            game_lengths_arr = [move-1] * move
+            moves_total += moves_arr
             names_total += names_list
             game_lengths_total += game_lengths_arr
             if time.time() - start_interval > .1:
@@ -189,7 +170,6 @@ def _play_and_gen_data(args):
                 names_total = []
                 start_interval = time.time()
                 interval_ngames = 0
-            game += 1
 
 
         results_queue.put((interval_ngames, pos_list_total, prob_list_total, value_targets_total,moves_total, game_lengths_total, names_total, True))
@@ -210,26 +190,24 @@ class DataGenerator:
         self.ort_info = ort_info
         self.stopevent=stopevent
 
-    def generate(self, ngames=np.inf, nsamples=np.inf, return_data=False):
+    def generate(self, ngames, *, nsamples=np.inf, return_data=False):
         results_queue = multiprocessing.Queue()
         start = time.time()
         print(f"====================================")
-        print(f"Generating training data")
-        print(f"Sample cap: {nsamples}")
-        print(f"Games cap : {ngames}")
-        print(f"Threads   : {self.nthreads}")
-        print(f"Play parameters:")
-        for key, value in self.playparam.items():
-            print(f"    {key}: {value}")
-        print(f"Players:")
+        print(f"Generating training data ({ngames} games with {self.nthreads} threads)")
+        if nsamples is not None:
+            print(f"Sample cap is {nsamples} (target)")
         for i, (name, cfg) in enumerate(zip(self.player_names, self.player_configs)):
             print(f"Player {i+1}: {name}")
             print(f"    has config {clip_cfg(cfg)}")
 
         games_per_core = max(1, ngames // self.nthreads)
-        samples_per_core = max(1, nsamples // self.nthreads)
+        leftovers = ngames % self.nthreads
+        if games_per_core == 1:
+            leftovers = 0
+            ngames = self.nthreads
         stopevent = mp.Event()
-        args = [(self.player_names, self.player_configs, games_per_core, samples_per_core, self.playparam, _, results_queue, stopevent, self.ort_info) for _ in range(self.nthreads)]
+        args = [(self.player_names, self.player_configs, games_per_core if (_!=0) else games_per_core + leftovers, self.playparam, _, results_queue, stopevent, self.ort_info) for _ in range(self.nthreads)]
         threads_finished = 0
         need_gpu_manager = False
         for cfg in self.player_configs:
@@ -312,20 +290,19 @@ def main(ort_info):
     games_per_worker = 150
     worker_batch_size = 32
     ngames = nworkers * games_per_worker
-    model_path = "weights/2_players/datasize_300005_epochs_10_batch_256_lr_0.001_iteration_1.pth"
+    model_path = "weights/two_player.pth"
     # gpu_manager, gpu_manager_info = get_gpu_manager(nworkers=nworkers, worker_batch_size=worker_batch_size, model_path=model_path)
     player_names = [
             # "TSPEnv", 
             # "VNNMCTS",
             # "NNMCTS",
             # "NNMCTS",
-            "NN",
+            # "NN",
             # "TSPEnv", 
-            # "Random",
-            # "Capture",
+            "Random",
+            "Capture",
             "Smart",
-            # "Eager",
-            # "TSPEnv", 
+            "TSPEnv", 
             # "TSPEnv",
             # "TSPEnv",
             # "TSPDet",
@@ -338,25 +315,23 @@ def main(ort_info):
             # {"fname": model_path, "hyperparams": {"maxit": 20, "cpuct": 2, "epsilon": 25, "alpha":.2, "noise": False}, "ort_info":'', "return_type": "probabilities", "verbose": False},
             # {"fname": "weights/tw_ts_md_4_det.pth", "hyperparams": {"maxit":1}, "return_type": "probabilities"},
             # {"hyperparams": {"maxit": 1600, "num_sims": WORKER_BATCH_SIZE, "virtual_loss":1}, 'gpu_manager_info': gpu_manager_info},
-            # {"maxdepth": 5, "return_type": "unique_probabilities"},
-            # {"maxdepth": 5, "return_type": "unique_probabilities"},
-            {"fname": model_path, "ort_info":''},
             {},
-            # {},
-            # {},
+            {},
+            {},
+            {},
             # {"maxdepth": 3, "return_type": "unique_probabilities"},
             # {"maxdepth": 5, "return_type": "unique_probabilities"},
             # {"maxdepth": 5, "return_type": "probabilities", "maxit": 50},
+            # {"fname": "weights/tw_ts_md_4.pth"},
             # {"maxdepth": 1, "return_type": "probabilities", 'store_rng': False},
             # {"maxdepth": 1, "return_type": "best_action", 'store_rng': False},
             # {"maxdepth": 1, "return_type": "best_action", 'store_rng': False},
             # {"maxdepth": 1, "return_type": "probabilities", 'store_rng': False},
             # {"maxdepth": 1, "return_type": "probabilities", 'store_rng': False},
     ]
-    # playparam = {"tau": 1, "best_play_move": 10, "alpha_best_play": 1, "include_move_fraction": .1}
-    playparam = {"tau": 1, "best_play_move": 10, "alpha_best_play": 1, "include_move_fraction": np.inf}
+    playparam = {"tau": 1, "best_play_move": 10}
     generator = DataGenerator(player_names, player_configs, playparam, nthreads=nworkers, ort_info=ort_info)
-    datafname = generator.generate(nsamples=30000)
+    datafname = generator.generate(ngames)
     data = generator.data
     data.show_random()
     data.save_statistics()

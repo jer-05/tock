@@ -1,486 +1,388 @@
 import torch
-from torch import nn
-from torch.utils.data import DataLoader
-from torch.utils.data import random_split
 import numpy as np
 import os
+import time
 import traceback
 from datetime import datetime
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from contextlib import redirect_stdout
+import multiprocessing
+import torch.multiprocessing as mp
+import random
+import pickle
+import copy
+import threading
 
 from tock import make, DEAL_ORDER, AVERAGE_GAME_LENGTH
+from fasttock import AVERAGE_GAME_LENGTHS
 from network import PolicyNN
-from utils import policy_to_actions, remove_dirs, clear_lines
+from utils import remove_dirs, clear_lines, print_block, print_important, print_v, check_abortion
 from data import GameData
-from players import NNPlayer
+from players import NNPlayer, clip_cfg
 from mcts import MCTS, Node, totorch
 from competition import Competition
 from datagen import DataGenerator
-from gpu_manager import get_gpu_manager
 from filemanager import TrainingFileManager
 from hyperparameter_manager import HyperparameterManager
+from elo_manager import EloManager
+from nn_trainer import NNTrainer
 
 device = torch.device("cuda") if torch.cuda.is_available() else 'cpu'
 
 WEIGHTS_DIR = "weights"
 TRAINING_FIG_DIR = "figures/training"
 
-def get_value_weights(move_values, reference_move=AVERAGE_GAME_LENGTH, nplayers=2):
-    sigmoid_halfpoint = reference_move // 2 
-    smoothening = reference_move // 8
-    sigmoids = 1 / (1 + torch.exp((move_values - sigmoid_halfpoint) / smoothening))
-    return torch.clip(sigmoids, 0.1, 1)
+DEFAULT_PLAYER_NAMES = [
+        "Random",
+        "Eager",
+        "Smart",
+        "TSPDet",
+        "TSPEnv",
+]
+DEFAULT_PLAYER_CONFIGS = [
+        {},
+        {},
+        {},
+        {"maxdepth": 4, "maxit": 30}, 
+        {"maxdepth": 7}
+]
 
 class Trainer():
-    def __init__(self, nn, *, data_fname=None, weights_fname=None, hyperparams={}, loadblob=False):
-        self.datalen_ctr = 0
-        self.nw = nn.to(device)
-
-        self.tfm = TrainingFileManager()
-        self.hpm = HyperparameterManager(hyperparams)
-
-        self.data = GameData()
-        self.pretraining = False
-        if data_fname is not None:
-            print(f"Loading pre-generated data from {data_fname}")
-            if loadblob:
-                self.data.load_blobs(data_fname)
+    def __init__(self, *, hyperparams, ort_info, old_session_idx=None, verbose=False):
+        print_v("Initializing trainer")
+        self.ort_info = ort_info
+        self.stopevent = mp.Event()
+        self.verbose = verbose
+        self.nplayers = hyperparams["nplayers"]
+        self.tfm = TrainingFileManager(old_session_idx, verbose=self.verbose)
+        hpp_fname = self.tfm.getlatest("hppdump", soft_fail=True)
+        if hpp_fname is not None and hyperparams is None:
+            print("Using previously saved hyperparameters")
+            with open(hpp_fname, "rb") as f:
+                hyperparams = pickle.load(f)
+        else:
+            if hyperparams is None:
+                print_important("Using dummy hyperparameters")
+                with open("hyperparameters/dummy.pkl", "rb") as f:
+                    hyperparams = pickle.load(f)
             else:
-                self.data.load(data_fname)
-            self.pretraining = True
-        else:
-            self.pretraining = False
-        self.data.cut_buffer_size(self.hpm["replay_buffer_size"])
+                print("Using hyperparameters passed to function call")
+            self.tfm.save(hyperparams, "hpp")
 
-        if weights_fname is not None:
-            print(f"Loading pre-trained model from {weights_fname}")
-            self.nw.load(weights_fname)
+        self.hpm = HyperparameterManager(hyperparams, ncycle_not_evolved=self.tfm.cycle_ctr)
+        self.nw = PolicyNN(self.nplayers)
+        em_dump_fname = self.tfm.getlatest("elodump", soft_fail=True)
+        if em_dump_fname is None:
+            self.em = EloManager(nplayers=self.nplayers, verbose=self.verbose, challenger_id={"fname": "current"})
         else:
-            print(f"Starting from scratch; no pre-trained model was loaded")
-        self.tfm.save(self.nw.state_dict(), "wcurr")
+            with open(em_dump_fname, "rb") as f:
+                self.em = pickle.load(f)
+        self.always_evolve = False
+        if "always_evolve" in hyperparams and hyperparams["always_evolve"]==True:
+            self.always_evolve = True
+            print(f"Always evolving !!!")
 
-        if device == torch.device("cuda"):
-            print("Training on GPU")
+        self.data = GameData(nplayers=self.nplayers)
+        self.data.set_buffer_size(self.hpm["replay_buffer_size"])
+        if (datafname:=self.tfm.getlatest("data", soft_fail=True)) is not None:
+            print(f"Loading saved replay buffer")
+            self.data.load_dir(datafname)
+            agefname = self.tfm.getlatest("dataage")
+            print(f"Loading saved data age file")
+            self.data_ages = torch.load(agefname, weights_only=False)
+            self.data_age = min(self.data_ages) - 1
         else:
-            print("Training on CPU")
-        self.cpt_log = "competition_log.txt"
-        self.train_log = "train_log.txt"
-        self.datagen_log = "datagen_log.txt"
+            self.data_age = 0
+            self.data_ages = []
 
-    def gen_train_data(self, startup):
-        if not startup:
-            maxit = self.hpm["self_play_mcts_maxit"]
-        else:
-            maxit = 50
-            print(f"Using startup maxit of {maxit}!")
-        self.data.cut_buffer_size(self.hpm["replay_buffer_size"])
+        if self.tfm.evo_ctr == 0 and self.tfm.cycle_ctr == 0:
+            self.tfm.save(self.nw.state_dict(), "wcurr", idd="start_weights")
+        self.nn_trainer = NNTrainer(self.nw, self.data, data_ages=self.data_ages, filemanager=self.tfm)
 
+
+    def gen_train_data(self):
         print(f"Starting self-play")
         former_len = len(self.data)
         print(f"Already {former_len} samples in database")
-        if self.hpm.switch_datagen_model(verbose=True):
+        if self.hpm.switch_datagen_model():
+            print(f"Model did not improve for self.{self.tfm.cycle_ctr} self-play cycles, so using best model for data generation")
             model_path = self.tfm.getlatest("wbest")
         else:
             model_path = self.tfm.getlatest("wcurr")
-        gpu_mgr, player_names, player_configs =\
-                self.get_gpu_mgr_and_players(model_path, maxit, return_type="probabilities", get_n_players=True)
-        generator = DataGenerator(player_names, player_configs, self.hpm["play_params"], nthreads=self.hpm["nworkers"], gpu_manager=gpu_mgr)
-        data = generator.generate(self.hpm["self_play_ngames"], return_data=True)
-        self.datalen_ctr += len(data)
-        self.data.load(data=data, load_from_data=True, append=True)
-        if self.datalen_ctr > self.hpm["replay_buffer_size"]:
-            self.tfm.save(self.data, "data")
-            self.datalen_ctr = 0
-
-    def train_nn(self, *, epochs=None, train_ratio = 0.8, lr = 1e-3, gamma = .98, cutoff_lr = 1e-6, use_valid_set = True, use_value_scaling=False, fname = None, save_checkpoints=False, reduce_lr_on_plateau=False):
-        batch_size = self.hpm["train_batch_size"]
-        if epochs:
-            steps = round(len(self.data) / batch_size * epochs)
-        else:
-            steps = round(self.hpm["train_steps"])
-        print("-----------------")
-        print("Training PolicyNN")
-        print(f"Total amount of samples is {len(self.data)}")
-        appr_epochs = batch_size * steps / len(self.data)
-        print(f"Will be training NN for {steps} steps (~= {appr_epochs:.1f} epochs)")
-        print("-------------------")
-        if use_valid_set:
-            valid_ratio = 1- train_ratio
-            train_set, valid_set = random_split(self.data, [train_ratio, valid_ratio])
-            train_dl = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-            valid_dl = DataLoader(valid_set, batch_size=batch_size, shuffle=True)
-        else:
-            train_dl = valid_dl = DataLoader(self.data, batch_size=batch_size, shuffle = True)
-
-        optimizer = torch.optim.AdamW(params=self.nw.parameters(), lr=lr, weight_decay = 0.01)
-        if reduce_lr_on_plateau:
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer = optimizer,
-                mode = 'min',
-                factor = 0.1,
-                patience = 1,
-                threshold = 1e-4,
-            )
-        maxk = 4
-
-        checkpoint = max(1, steps // 20)
-        train_losses = []
-        valid_losses = []
-        train_accs = [[] for i in range(maxk)]
-        valid_accs = [[] for i in range(maxk)]
-
-        step = 0
-        cutoff=False
-
-        try:
-            while step < steps and not cutoff:
-                self.nw.train()
-                try:
-                    for batch, (X , (y_prob, y_val)) in enumerate(train_dl):
-                        # print(f"Now doing batch {batch}!")
-                        X = [x.to(device) for x in X]
-                        y_prob, y_val = y_prob.to(device), y_val.to(device)
-                        # print(f"About to pass to nn!")
-                        # print(self.nw)
-                        logits, value_head = self.nw(*X)
-                        # print(f"Calculating loss!")
-                        policy_loss = self.nw.p_loss(logits, y_prob)
-
-                        # reduce gradients in opening. Factor in front of X[5] (rounds) is an estimation for the average amount of moves per round
-                        if use_value_scaling:
-                            value_weights = 1 - get_value_weights(X[5].detach() * self.hpm["nplayers"] / 2 * sum(DEAL_ORDER) / len(DEAL_ORDER))
-                            value_loss = self.nw.v_loss(value_head * value_weights, y_val.view(-1, 1) * value_weights)
-                        else:
-                            value_loss = self.nw.v_loss(value_head, y_val.view(-1, 1) if self.hpm["nplayers"] == 2 else y_val)
-                        loss = policy_loss + value_loss
-                        loss.backward()
-                        optimizer.step()
-                        optimizer.zero_grad()
-                        if step % checkpoint == checkpoint - 1 :
-                            train_loss, train_acc = self.check_loss(train_dl)
-                            valid_loss, valid_acc = self.check_loss(valid_dl)
-                            train_losses.append(train_loss)
-                            valid_losses.append(valid_loss)
-                            for k in range(maxk):
-                                train_accs[k].append(train_acc[k])
-                                valid_accs[k].append(valid_acc[k])
-                            if reduce_lr_on_plateau:
-                                scheduler.step(sum(valid_loss))
-                                lr = scheduler.get_last_lr()[0]
-                                if lr < cutoff_lr:
-                                    print(f"Learning rate is now {lr} < {cutoff_lr} (cutoff), so aborted training.")
-                                    cutoff=True
-                                    break
-                            
-                            train_acc_s = ""
-                            valid_acc_s = ""
-                            for k in range(maxk):
-                                train_acc_s += f"k={k+1}: {train_acc[k]*100:.1f}%  "
-                                valid_acc_s += f"k={k+1}: {valid_acc[k]*100:.1f}%  "
-                            if step != checkpoint - 1:
-                                clear_lines(6)
-                            print(f"[{step+1}/{steps}]:\n"
-                                  f"\tTrain: policy loss {train_loss[0]:.4f}, value loss {train_loss[1]:.4f}\n\t\tacc. ", train_acc_s,
-                                  f"\n\tValid: policy loss {valid_loss[0]:.4f}, value loss {valid_loss[1]:.4f}\n\t\tacc. ", valid_acc_s,
-                                  f"\n\tLearning Rate: {lr}"
-                            )
-                            if save_checkpoints:
-                                torch.save(self.nw.state_dict(), f"weights/checkpoints/checkpoint_{(step+1) //checkpoint}.pth")
-                        step += 1
-                        if step >= steps:
-                            break
-                except Exception as e:
-                    traceback.print_exc()
-                    breakpoint()
-            appr_epochs = step * batch_size / len(self.data)
-            print(f"Trained NN for {step} steps (~= {appr_epochs:.1f} epochs)")
-            print("-------------------")
-            self.tfm.save(self.nw.state_dict(), "wcurr")
-            if fname is not None:
-                torch.save(self.nw.state_dict(), fname)
-            self.plot_losses_accs(range(len(train_losses)), np.array(train_losses), np.array(valid_losses),\
-                    train_accs, valid_accs)
-            self.test_current()
-        except KeyboardInterrupt:
-            self.emergency_save()
-            
-    def get_top_k_acc(self, output, target, k=5):
-        """
-        output: [batch, 52] (Raw Logits)
-        target: [batch, 52] (Probabilities from Tree Search)
-        """
-        with torch.no_grad():
-            # Get the index of the best move from the Tree Search
-            target_idx = torch.argmax(target, dim=1)
-            
-            # Get the indices of the top K moves from the NN
-            _, pred_indices = output.topk(k, dim=1)
-            
-            # Check if the target index is anywhere in those top K
-            # expand_as handles the batch dimension comparison
-            correct = pred_indices.eq(target_idx.view(-1, 1).expand_as(pred_indices))
-            return correct.float().sum() / target.size(0)
-
-    def check_loss(self, dl, maxk = 4, extra_info=False):
-        self.nw.eval()
-        total_loss = np.zeros(2)
-        accs = np.zeros(maxk)
-        with torch.no_grad():
-            for batch, (X , (y_prob, y_val)) in enumerate(dl):
-                X = [x.to(device) for x in X]
-                y_prob, y_val = y_prob.to(device), y_val.to(device)
-                logits, value_head = self.nw(*X)
-                for k in range(maxk):
-                    accs[k] += self.get_top_k_acc(logits, y_prob, k=k+1)
-                policy_loss = self.nw.p_loss(logits, y_prob)
-                policy = self.nw.softmax(logits)
-                value_loss = self.nw.v_loss(value_head, y_val.view(-1, 1) if self.hpm["nplayers"] == 2 else y_val)
-                loss = np.array([policy_loss.cpu().item(), value_loss.cpu().item()])
-                total_loss += loss
-        av_loss = total_loss / len(dl)
-        accs = accs / len(dl)
-        return av_loss, accs
-
-    def test_current(self, maxk=4):
-        print("----------------")
-        print(f"Testing performance of model on dataset (length {len(self.data)})")
-        dl = DataLoader(self.data, batch_size=64)
-        av_loss, accs = self.check_loss(dl, maxk=maxk)
-        print(f"Loss: policy -> {av_loss[0]:.2f}, value -> {av_loss[1]:.2f}")
-        acc_s = ""
-        for k in range(maxk):
-            acc_s += f"k={k+1}: {accs[k]*100:.1f}%  "
-        print(f"Acc.: ", acc_s)
-        print("-----------------")
-        
-    def plot_losses_accs(self, checkpoints, train_losses, valid_losses, train_accs, valid_accs):
-        print("Plotting training progress")
-        fig, ax = plt.subplots(4, figsize = (9, 9))
-        fig.suptitle("Training progress")
-        ax[0].set_title("Policy Loss")
-        ax[0].plot(checkpoints, train_losses[:, 0], label="Train Loss")
-        ax[0].plot(checkpoints, valid_losses[:, 0], label="Validation Loss")
-        ax[0].legend()
-
-        ax[1].set_title("Value Loss")
-        ax[1].plot(checkpoints, train_losses[:, 1], label="Train Loss")
-        ax[1].plot(checkpoints, valid_losses[:, 1], label="Validation Loss")
-        ax[1].legend()
-        
-        ax[2].set_title("Training Accuracy")
-        for k in range(len(train_accs)):
-            ax[2].plot(checkpoints, train_accs[k], label=f"k={k+1}")
-        ax[2].legend()
-
-        ax[3].set_title("Validation Accuracy")
-        for k in range(len(valid_accs)):
-            ax[3].plot(checkpoints, valid_accs[k], label=f"k={k+1}")
-        ax[3].legend()
-
-        fig.tight_layout()
-        self.tfm.save(fig, "train")
-        plt.close('all')
+        generator = DataGenerator(*self.get_players([model_path] * self.nplayers, False), self.hpm["play_params"], nthreads=self.hpm["nworkers"], ort_info=self.ort_info, stopevent=self.stopevent)
+        gen_epochs = self.hpm["self_play_epochs_per_cycle"] / self.hpm["train_play_rounds_per_cycle"]
+        gen_samples = round(gen_epochs * self.hpm["replay_buffer_size"])
+        appr_gen_games = round(1.5 * gen_samples / AVERAGE_GAME_LENGTHS[str(self.nplayers)])
+        data = generator.generate(appr_gen_games, nsamples = gen_samples, return_data=True)
+        self.data_ages += [self.data_age] * len(data)
+        self.data_age -= 1
+        self.data.load_data(data, preserve_buffer_size=True)
+        self.tfm.save(self.data, "data")
+        self.tfm.save(self.data_ages, "dataage")
+        assert self.data_age == min(self.data_ages) - 1
 
     def train(self):
+        print_v("Training started")
+        self.stopevent = mp.Event()
+        stopper = threading.Thread(target=check_abortion, args=[self.stopevent], kwargs={"reset":True}, daemon=True)
+        stopper.start()
         try:
-            print("Starting training")
-
-            max_cycles = self.hpm["train_play_cycles"]
-            if self.pretraining:
-                print(f"Starting training with generated data (already {len(self.data)} samples available)")
-                self.train_nn(epochs=50)
-            evo_cycle = 0
-            while not self.hpm.stop_training():
-                print(f"-------------------------------------------")
-                print(f"Now starting train and play cycle {evo_cycle}")
+            rounds_per_cycle = self.hpm["train_play_rounds_per_cycle"]
+            while not self.hpm.stop_training() and not self.stopevent.is_set():
+                print_block(f"Evolution {self.tfm.evo_ctr} | Cycle {self.tfm.cycle_ctr}")
                 print(self.hpm)
-                for cycle in range(max_cycles):
-                    print(f"-------------------------------------------")
-                    print(f"Now starting train and play round {evo_cycle * max_cycles + cycle}")
-                    if evo_cycle == 0:
-                        startup = True
-                    else:
-                        startup = False
-                    self.gen_train_data(startup=startup)
-                    self.train_nn(lr=self.hpm["lr"])
-                print(f"\nChecking improvement of model!")
+                while self.tfm.round_ctr < rounds_per_cycle and not self.stopevent.is_set():
+                    print_block(f"Round {self.tfm.round_ctr}")
+                    self.gen_train_data()
+                    self.nn_trainer.train_nn(
+                        self.hpm["train_epochs"],
+                        self.hpm["lr"], 
+                        self.hpm["train_batch_size"], 
+                        gamma = self.hpm["sampler_gamma_decay"],
+                        min_value_loss_weight=self.hpm["min_value_loss_train_weight"]
+                    )
+                    self.tfm.plusround()
+                if self.stopevent.is_set():
+                    break
+                self.nn_trainer.plot_losses_accs(plotall=True)
                 self.evolve()
-                evo_cycle += 1
-            self.model_evolution_benchmark()
-        except KeyboardInterrupt:
-            self.model_evolution_benchmark()
+        except (KeyboardInterrupt, EOFError, ConnectionResetError, BrokenPipeError):
+            pass
+        if not self.hpm.stop_training(verbose=False):
+            print_important("Interrupted training")
+        self.em.update_elo()
+        self.tfm.save(self.em, "elo")
+        self.model_evolution_benchmark()
+        print_block("Training ended")
 
     def evolve(self):
-        if not self.tfm.getlatest("wbest", soft_fail=True):
+        if self.tfm.getlatest("wbest", soft_fail=True) is None:
             print("No best model yet, setting current to best by default")
-            self.tfm.save(self.nw.state_dict(), "wbest")
+            self.tfm.save(self.nw.state_dict(), "wbest", idd="best")
             evolved = True
         else:
-            print("Comparing latest model to best")
+            print("Comparing current model to latest best model")
             best_model_fname = self.tfm.getlatest("wbest")
             current_model_fname = self.tfm.getlatest("wcurr")
-            gpu_manager_current, player_name_curr, player_config_curr =\
-                    self.get_gpu_mgr_and_players(current_model_fname, self.hpm["competition_mcts_maxit"])
-            gpu_manager_best, player_name_best, player_config_best =\
-                    self.get_gpu_mgr_and_players(current_model_fname, self.hpm["competition_mcts_maxit"])
+            [player_name_best, player_name_curr], [player_config_best, player_config_curr] = self.get_players([best_model_fname, current_model_fname], True)
+            curr_models = self.tfm.getall("wcurr")
             player_names = [player_name_curr, player_name_best]
             player_configs = [player_config_curr, player_config_best]
-
-
-            cpt = Competition(player_names, player_configs, gpu_managers=[gpu_manager_current, gpu_manager_best], nthreads=self.hpm["nworkers"])
-            results, fig = cpt.run(self.hpm["evo_competition_games"], return_results_and_fig=True)
-            wins_ratio = results[1, 0]
-            self.tfm.save(fig, "cpt")
-            fig.clf()
-            if wins_ratio > self.hpm["evo_win_criterion"]:
-                print(f"Evolving model! (win rate > {self.hpm["evo_win_criterion"]}%)")
-                self.tfm.save(self.nw.state_dict(), "wbest")
+            cpt = Competition(player_names, player_configs, gamemode = len(player_names), nthreads=self.hpm["nworkers"], ort_info=self.ort_info,filemanager=self.tfm, elo_manager=self.em, stopevent=self.stopevent)
+            cpt.run(self.hpm["evo_last_best_games"])
+            self.em.update_elo()
+            self.tfm.save(self.em, "elo")
+            self.em.plot_all_elo_progression(filemanager=self.tfm)
+            self.em.plot_elo_progression(player_name_curr, player_config_curr, filemanager=self.tfm, plot_split=True)
+            elo_best, ci_best = self.em[player_name_best, player_config_best]
+            elo_curr, ci_curr = self.em[player_name_curr, player_config_curr]
+            print(f"Elo of best model is {elo_best:.1f} ([{ci_best[0]:.1f}, {ci_best[1]:.1f}])")
+            print(f"Elo of current model is {elo_curr:.1f} ([{ci_curr[0]:.1f}, {ci_curr[1]:.1f}])")
+            if ci_best[1] < ci_curr[0] or self.always_evolve:
+                if self.always_evolve:
+                    print(f"Evolving because self.always_evolve is True")
+                self.tfm.save(self.nw.state_dict(), "wbest", idd="best")
+                new_best_model_fname = self.tfm.getlatest("wbest")
+                new_player_name_best, new_player_config_best = self.get_players([new_best_model_fname], True)
+                self.em.split_off_player(player_name_curr, player_config_curr, new_player_name_best, new_player_config_best)
                 evolved = True
             else:
-                print(f"Not evolving model (win rate < {self.hpm["evo_win_criterion"]}%)")
-                self.hpm.plusnotevolved()
                 evolved = False
+        old_best_models = self.tfm.getall("wbest")
         if evolved:
-            self.hpm.evolved()
-            print(f"Best model changed, so running benchmark")
-            if self.hpm["evo_benchmark_games"] == 0:
-                print(f"Skipping benchmark because ngames=0!")
-                return
-            current_model_fname = self.tfm.getlatest("wcurr")
-            gpu_manager_current, player_name, player_config =\
-                    self.get_gpu_mgr_and_players(current_model_fname, self.hpm["competition_mcts_maxit"])
-            opp_names = [
-                    "NN",
-                    "TSPDet",
-                    "Random",
-            ]
-            opp_configs = [
-                    {"fname": current_model_fname},
-                    {"maxdepth": 6, "maxit": 40},
-                    {},
-            ]
-            for opp_name, opp_config in zip(opp_names, opp_configs):
-                player_names = [player_name, opp_name]
-                player_configs = [player_config, opp_config]
-                cpt = Competition(player_names, player_configs, gpu_managers=[gpu_manager_current], nthreads=self.hpm["nworkers"])
-                results, fig = cpt.run(self.hpm["evo_benchmark_games"], return_results_and_fig=True)
-                self.tfm.save(fig, "cpt", idd=f"benchmark{opp_name}")
+            print_important("Evolved model")
+            self.em.plusevolve()
+            self.tfm.plusevolve()
+            self.hpm.plusevolve()
+            if self.verbose:
+                print(f"Skipping player with weights filename {old_best_models[-1]} (as it was just saved from the current model)")
+            old_best_models = old_best_models[:-1]
+        else:
+            print("Did not evolve model")
+            self.tfm.pluscycle()
+            self.hpm.pluscycle()
+        nbestmodels = len(old_best_models)
+        ndefault = len(DEFAULT_PLAYER_NAMES)
+        nmodels = min(ndefault + nbestmodels, self.hpm["max_benchmark_opponents"])
+        best_model_names, best_model_configs = self.get_players(old_best_models, True, nosqueeze=True)
+        best_model_weights = [self.em.get_weights(name, config) for name, config in zip(best_model_names, best_model_configs)]
+        default_model_weights = np.array([self.em.get_weights(name, config) for name, config in zip(DEFAULT_PLAYER_NAMES, DEFAULT_PLAYER_CONFIGS)])
+        if best_model_weights:
+            default_model_weights *= self.hpm["default_best_bm_ratio"] * sum(best_model_weights) / sum(default_model_weights)
+        weights = np.array(list(default_model_weights) + best_model_weights)
+        weights = weights / sum(weights)
+        chosen_indices = []
+        while len(chosen_indices) < nmodels:
+            choice = random.choices(range(len(weights)), weights=list(weights), k=1)[0]
+            if choice not in chosen_indices:
+                chosen_indices.append(choice)
+        opp_names = DEFAULT_PLAYER_NAMES + best_model_names
+        opp_configs = DEFAULT_PLAYER_CONFIGS + best_model_configs
+        print(f"Running benchmark")
+        print(f"Choosing opponents from player pool with choice distribution:")
+        for name, weight, config in zip(opp_names, weights, opp_configs):
+            print(f"  {name}: {weight*100:.1f}%", end='')
+            if name == "NNMCTS":
+                print(f" (fname: {clip_cfg(config)['fname']})")
+            else:
+                print()
+        chosen_names = [opp_names[i] for i in chosen_indices]
+        chosen_configs = [opp_configs[i] for i in chosen_indices]
+        player_name_curr, player_config_curr = self.get_players([self.tfm.getlatest("wcurr")], True)
+        bm_names = [player_name_curr] + chosen_names
+        bm_configs = [player_config_curr] + chosen_configs
+        cpt = Competition(bm_names, bm_configs, nthreads=self.hpm["nworkers"], ort_info=self.ort_info, filemanager=self.tfm, elo_manager=self.em, idd=f"benchmark", stopevent=self.stopevent)
+        ratio = self.hpm["evo_bm_lb_games_ratio"]
+        assert self.nplayers == 2
+        nrounds = (len(bm_names) * (len(bm_names) - 1) / 2)
+        total_games = ratio * self.hpm["evo_last_best_games"]
+        games_per_round =  total_games / nrounds
+        games_per_round = int((1 + games_per_round // self.hpm["nworkers"]) * self.hpm["nworkers"])
+        print(f"Will be running a total of {int(games_per_round * nrounds)} games; target is {int(total_games)} games")
+        cpt.run(games_per_round)
 
     def model_evolution_benchmark(self):
-        print(f"Running final benchmark to compare model generations")
-        gpu_mgrs = []
+        print(f"Running final benchmark")
+        best_model_fnames = self.tfm.getall("wbest")
+        nmodels = len(best_model_fnames)
+        if nmodels >= 2:
+            print(f"Running competition between NNMCTS players")
+            current_model_fname = self.tfm.getlatest("wcurr")
+            max_other_opp = self.hpm["max_benchmark_opponents"] - 2
+            nother_opp = nmodels - 2
+            indices = []
+            if min(max_other_opp, nother_opp) > 0:
+                ratio = nother_opp / max_other_opp
+                indices = [round(ratio * i + .01) for i in range(max_other_opp)]
+            indices = [0] + indices + [-1]
+            indices = list(set(indices))
+            fnames = [best_model_fnames[i] for i in indices]
+            fnames += [current_model_fname]
+            cpt = Competition(*self.get_players(fnames, True), nthreads=self.hpm["nworkers"], ort_info=self.ort_info, filemanager=self.tfm, idd="NNMCTS_benchmark", stopevent=self.stopevent)
+            cpt.run(self.hpm["evo_last_best_games"])
+        print(f"Running competition vs. default players")
+        fnames = [best_model_fnames[-1]] + DEFAULT_PLAYER_NAMES
+        cpt = Competition(*self.get_players(fnames, True), nthreads=self.hpm["nworkers"], ort_info=self.ort_info, filemanager=self.tfm, idd=f"default_player_benchmark", ladder_cpt=True, stopevent=self.stopevent)
+        cpt.run(self.hpm["evo_last_best_games"])
+ 
+    def get_players(self, fnames, competition, nosqueeze=False):
         player_names = []
         player_configs = []
-        fnames = self.tfm.getall("wbest")
-        if len(fnames) < 2:
-            print(f"Only {len(fnames)} model was saved, so cannot run benchmark")
-            return
-        max_models = 5
-        nmodels = len(fnames)
-        skip_models = max(0, nmodels - max_models)
-        if skip_models > 0:
-            skip_frequency = skip_models / nmodels
-            play_model = []
-            incr = 0
-            for i in range(nmodels):
-                incr += skip_frequency
-                if incr > .5:
-                    play_model.append(False)
-                    incr -= 1
-                else:
-                    play_model.append(True)
-        else:
-            play_model = [True] * nmodels
-
-        print(f"Will be benchmarking models:")
-        for i, (play, fname) in enumerate(zip(play_model, fnames)):
-            if play:
-                print(f"   model {i}: {fname}")
-        print(f"(Skipping {skip_models} models)")
-
-
-        for play, fname in zip(play_model, fnames):
-            if not play:
-                continue
-            gpu_mgr, player_name, player_config =\
-                self.get_gpu_mgr_and_players(fname, self.hpm["competition_mcts_maxit"])
-            gpu_mgrs += [gpu_mgr]
-            player_names += [player_name]
-            player_configs += [player_config]
-        cpt = Competition(player_names, player_configs, gpu_managers=gpu_mgrs, nthreads=self.hpm["nworkers"])
-        results, fig = cpt.run(self.hpm["evo_competition_games"], return_results_and_fig=True)
-        self.tfm.save(fig, "cpt", idd="final_benchmark")
-
- 
-    def get_gpu_mgr_and_players(self, fname, maxit, return_type=None, get_n_players=False):
-        worker_batch_size = self.hpm["worker_batch_size"]
         nworkers = self.hpm["nworkers"]
-        gpu_manager, gpu_manager_info = get_gpu_manager(nworkers=nworkers, worker_batch_size=worker_batch_size, model_path=fname)
-        player_name = "VNNMCTS"
-        player_config = {"hyperparams": {"maxit": maxit, "num_sims": worker_batch_size, "virtual_loss":1}, 'gpu_manager_info': gpu_manager_info}
-        if return_type is not None:
-            player_config["return_type"] = return_type
-        if get_n_players:
-            return gpu_manager, [player_name] * self.hpm["nplayers"], [player_config] * self.hpm["nplayers"]
-        return gpu_manager, player_name, player_config
+        player_name = "NNMCTS"
+        if competition:
+            maxit = self.hpm["competition_mcts_maxit"]
+        else:
+            total_rounds = (self.tfm.cycle_ctr + self.tfm.evo_ctr) * self.hpm["train_play_rounds_per_cycle"] + self.tfm.round_ctr
+            it_incr_per_round = max(1, self.hpm["self_play_mcts_maxit"] / (self.hpm["train_play_rounds_per_cycle"] * 2.5))
+            linear_maxit = max(1, (total_rounds + 1) * it_incr_per_round)
+            maxit = int(min(self.hpm["self_play_mcts_maxit"], linear_maxit))
+        player_config = {
+            "hyperparams": 
+                {
+                    "maxit": maxit, 
+                    "cpuct": 2, 
+                    "epsilon": .25, 
+                    "alpha": .2, 
+                    "noise": not competition
+                }, 
+            "ort_info": "", 
+            "return_type": "best_action" if competition else "unique_probabilities"
+        }
+        for fname in fnames:
+            if fname in DEFAULT_PLAYER_NAMES:
+                player_names.append(fname)
+                player_configs.append(DEFAULT_PLAYER_CONFIGS[DEFAULT_PLAYER_NAMES.index(fname)])
+            else:
+                player_names.append("NNMCTS")
+                cfg = player_config
+                cfg["fname"] = fname
+                player_configs.append(copy.deepcopy(cfg))
+        if len(player_names) == 1 and not nosqueeze:
+            return player_names[0], player_configs[0]
+        return player_names, player_configs
 
-    def emergency_save(self):
-        print("Emergency save!")
-        self.tfm.save(self.nw.state_dict(), "weight", fname="emergency_save.pth")
-
-def main():
+def main(ort_info):
+    nworkers = 4 if os.cpu_count() == 8 else 16
     dummy_hyperparams = {
-            "replay_buffer_size": 3000, 
-            "nworkers": 16,
-            "worker_batch_size": 32,
-            "self_play_ngames": 16,
-            "self_play_mcts_maxit": 1,
-            "competition_mcts_maxit": 1,
-            "max_cycle_not_evolved": 5,
-            "train_play_cycles": 2,
-            "evo_competition_games": 16,
-            "evo_benchmark_games": 0,
-            "evo_win_criterion": 55,
-            "train_batch_size": 128,
-            "train_steps": 10,
+            "min_value_loss_train_weight": .1,
+            "replay_buffer_size": 2000, 
+            "nworkers": nworkers,
+            "self_play_epochs_per_cycle": .15,
+            "self_play_mcts_maxit": 50,
+            "competition_mcts_maxit": 10,
+            "max_cycle_not_evolved": 2,
+            "train_play_rounds_per_cycle": 2,
+            "evo_last_best_games": nworkers,
+            "evo_bm_lb_games_ratio": 1.5,
+            "train_batch_size": 8,
+            "train_epochs": 1,
+            "max_gamma_decay": .1,
+            "default_best_bm_ratio":1,
             "lr": 1e-3,
             "play_params": {
                 "tau": 1,
                 "best_play_move": 10,
             },
             "nplayers": 2,
+            "always_evolve": False,
+            "max_benchmark_opponents": 1,
+    }
+    with open("hyperparameters/dummy.pkl", "wb") as f:
+        pickle.dump(dummy_hyperparams, f)
+    quick_hyperparams = {
+            "min_value_loss_train_weight": .2,
+            "replay_buffer_size": 150000,
+            "nworkers": 4 if os.cpu_count() == 8 else 16,
+            "self_play_epochs_per_cycle": .15,
+            "self_play_mcts_maxit": 80,
+            "competition_mcts_maxit": 100,
+            "train_play_rounds_per_cycle": 4,
+            "max_cycle_not_evolved": 10,
+            "evo_last_best_games": 160,
+            "evo_bm_lb_games_ratio": 1,
+            "train_batch_size": 512,
+            "default_best_bm_ratio":1,
+            "train_epochs": 6,
+            "max_gamma_decay": .1,
+            "lr": 1e-3,
+            "play_params": {
+                "tau": 1,
+                "best_play_move": 10,
+            },
+            "nplayers": 2,
+            "max_benchmark_opponents": 3,
     }
     hyperparams = {
-            "replay_buffer_size": 40000,
-            "nworkers": 16,
-            "worker_batch_size": 16,
-            "self_play_ngames": 100,
-            "self_play_mcts_maxit": 500,
-            "competition_mcts_maxit": 800,
-            "train_play_cycles": 5,
-            "max_cycle_not_evolved": 14,
-            "evo_competition_games": 500,
-            "evo_benchmark_games": 200,
-            "evo_win_criterion": 55,
+            "min_value_loss_train_weight": .1,
+            "replay_buffer_size": 200000,
+            "nworkers": 4 if os.cpu_count() == 8 else 16,
+            "self_play_epochs_per_cycle": .15,
+            "self_play_mcts_maxit": 450,
+            "train_play_rounds_per_cycle": 5,
+            "competition_mcts_maxit": 700,
+            "default_best_bm_ratio":1,
+            "max_cycle_not_evolved": 10,
+            "evo_last_best_games": 400,
+            "evo_bm_lb_games_ratio": 1,
             "train_batch_size": 512,
-            "train_steps": 100,
+            "train_epochs": 7,
+            "max_gamma_decay": .1,
             "lr": 1e-3,
             "play_params": {
                 "tau": 1,
                 "best_play_move": 10,
             },
             "nplayers": 2,
+            "max_benchmark_opponents": 4,
     }
     nplayers = 2
-    trainer = Trainer(PolicyNN(nplayers=nplayers), hyperparams=hyperparams)
+    old_session_idx = None
+    trainer = Trainer(hyperparams=quick_hyperparams, ort_info=ort_info, old_session_idx = old_session_idx, verbose=False)
     trainer.train()
-    # for i in range(7):
-    #     trainer.tfm.save(trainer.nw.state_dict(), "wbest")
-    #     trainer.tfm.plusevo()
-    # trainer.model_evolution_benchmark()
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    from mp_ort_import import exec_main
+    exec_main(main)

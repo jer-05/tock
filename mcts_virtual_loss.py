@@ -52,7 +52,7 @@ class VMCTS:
                 "cpuct": 2,
                 "maxit": 50,
                 "num_sims": 16,
-                "virtual_loss": 1,
+                "virtual_loss": 3,
         }
         for key, value in hyperparams.items():
             self.hyperparams[key] = value

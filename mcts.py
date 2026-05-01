@@ -3,14 +3,25 @@ from random import choice
 import numpy as np
 import copy
 import torch
+import torch._inductor.config as config
+config.fx_graph_cache = True
 import traceback
 import graphviz
 import time
+import os
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.abspath("./compiled_model_cache")
+import torch.onnx
+import onnxruntime as ort
+import cProfile
+
+
 
 from tock import make, PLACES_PER_SEGMENT, DEAL_ORDER, RANKS
-from fasttock import FastTockGame, ACTION_TUPLES
+from fasttock import FastTockGame, ACTION_TUPLES, return_search_results, print_action_space, print_cards, CONCISE_ACTION_IDX_TO_NAME
 from network import PolicyNN
-from utils import getstate, totorch, get_action_prob, revert_action_prob, get_action_string, print_evals_and_info, get_card_str, get_obs_str, get_unique_actions
+from utils import getstate, totorch, get_action_string, get_card_str, get_obs_str, get_ort_inference_session, print_block, print_important, print_v
+
+import cProfile
 
 CURRENT_PLAYER = 0
 
@@ -27,12 +38,13 @@ class Node:
         self.nplayers = nplayers
 
     def generate_children(self):
-        self.children = [Node(self, self.nplayers) for i in range(52)]
+        assert self.children is None
+        self.children = [Node(self, self.nplayers) for i in range(50)]
 
     def get_child_s_n(self, mask):
         try:
-            child_s = np.array([self.children[i].s for i in range(52)])[mask]
-            child_n = np.array([self.children[i].n for i in range(52)])[mask]
+            child_s = np.array([self.children[i].s for i in range(50)])[mask]
+            child_n = np.array([self.children[i].n for i in range(50)])[mask]
         except:
             traceback.print_exc()
             breakpoint()
@@ -87,11 +99,11 @@ class Node:
                 highest_n = child.n
         best_child.print_hot_path(is_leader_flag=False)
 
-def print_tree(game, root, root_action_prob, root_value, puct_scores, maxdepth=3, maxit="?", *, max_branching = 4, root_player):
+def print_tree(game, root, root_action_prob, root_value, root_action_mask, puct_scores, maxdepth=3, maxit="?", *, max_branching = 4, root_player, dirichlet_noise, Q, U):
     dot = graphviz.Digraph()
     nplayers = root.nplayers
 
-    label = f"MCTS nodes after {maxit} iterations (N:= Visits, V:= Win Rate)"
+    label = f"MCTS nodes after {maxit} iterations (N:= Visits, V:= Value)"
     dot.attr(label=label, labelloc='t', fontsize='20', fontname="Helvetica-bold")
 
     dot.attr('node', shape='box', style='filled', fontname="Helvetica")
@@ -101,29 +113,33 @@ def print_tree(game, root, root_action_prob, root_value, puct_scores, maxdepth=3
         dist = node.player_dist
         string = ""
         string += f"N: {node.n}\n"
-        if nplayers == 2:
-            string += f"V: {node.s/node.n:.2f}\n"
-        else:
-            string += "V: "
-            for i in range(nplayers):
-                string += f"{node.s[i]/node.n:.2f}, "
-            string = string[:-2] + "\n"
+        if node.n > 0:
+            if nplayers == 2:
+                string += f"V: {node.s/node.n:.2f}\n"
+            else:
+                string += "V: "
+                for i in range(nplayers):
+                    string += f"{node.s[i]/node.n:.2f}, "
+                string = string[:-2] + "\n"
 
-        if get_player_dist:
-            for i in range(len(dist)):
-                string += f"P{i}: {dist[i]/node.n*100:.1f}%\n"
+            if get_player_dist:
+                for i in range(len(dist)):
+                    string += f"P{i}: {dist[i]/node.n*100:.1f}%\n"
         return string
 
     def _get_colors(child):
-        if nplayers == 2:
-            value = int(child.s/child.n * 255)
+        if child.n == 0:
+            value_hexcode = "#D3D3D3"
         else:
-            childs = (child.s[root_player] - .5) * 2
-            value = int(childs/child.n * 255)
-        r = min(255, 255 + value)
-        g = 255 - abs(value)
-        b = min(255, 255 - value)
-        value_hexcode = f"#{r:02x}{g:02x}{b:02x}"
+            if nplayers == 2:
+                value = int(child.s/child.n * 255)
+            else:
+                childs = (child.s[root_player] - .5) * 2
+                value = int(childs/child.n * 255)
+            r = min(255, 255 + value)
+            g = 255 - abs(value)
+            b = min(255, 255 - value)
+            value_hexcode = f"#{r:02x}{g:02x}{b:02x}"
         return value_hexcode
 
     def _n_children(node):
@@ -136,7 +152,7 @@ def print_tree(game, root, root_action_prob, root_value, puct_scores, maxdepth=3
     def _add_node(node, depth):
         node_id = str(id(node))
 
-        if depth > maxdepth or node.children is None:
+        if depth >= maxdepth or node.children is None:
             return 
 
         n_children, child_n = _n_children(node)
@@ -148,25 +164,19 @@ def print_tree(game, root, root_action_prob, root_value, puct_scores, maxdepth=3
             best_children = node.children
             best_child_idx = range(len(node.children))
         s = 0
-        for idx, child in enumerate(best_children):
-            if child.n > 0:
-                i = best_child_idx[idx]
+        for action_number, child in enumerate(best_children):
+            if child.n > 0 or node == root and root_action_mask[action_number]:
+                i = best_child_idx[action_number]
                 child_id = str(id(child))
                 child_label = _get_label(child)
-                action_label = f"({RANKS[i // 4]}, {i %4})\n"
+                action_label = f"{CONCISE_ACTION_IDX_TO_NAME[action_number]}\n"
                 if node == root:
-                    action_tuple = (shifted_cards.index(i // 4), i % 4)
-                    action_idx = root_actions.index(action_tuple)
                     Q, U = root_q[s], root_u[s]
                     if nplayers != 2:
                         Q = Q[root_player]
                         U = U.item()
-                    try: 
-                        action_label += f"Policy={root_action_prob[s]*100:.1f}%\nQ={Q:.3f}\nU={U:.3f}\n"
-                    except:
-                        traceback.print_exc()
-                        breakpoint()
-                    obs, rew, done, info = game.step(action_tuple)
+                    action_label += f"Policy={root_action_prob[s]*100:.1f}%\nDir. Noise={format(dirichlet_noise[s]*100, '.1f')+'%' if dirichlet_noise is not None else 'None'}\nQ={Q:.3f}\nU={U:.3f}\nPUCT={puct_scores[s]:.3f}"
+                    obs, rew, done, info = game.step(action_number)
                     obs_str = get_obs_str(obs, 0)
                     child_label += obs_str
                     game.unmove()
@@ -183,21 +193,23 @@ def print_tree(game, root, root_action_prob, root_value, puct_scores, maxdepth=3
                     missing = n_children
                     desc = f"+{missing}"
                 dot.node(child_id, label=child_label, fillcolor=val_hex, xlabel=desc)
-                visit = int(child.n/node.n * 200)
+                if node.n != 0:
+                    visit = int(child.n/node.n * 200)
+                    width = child.n / root_n * 5
+                else:
+                    visit = 200
+                    width = 5
                 visit_hexcode = f"#{200-visit:02x}ff{200-visit:02x}"
-                visit_width = child.n / root_n * 100
-                width = child.n / root_n * 5
                 dot.edge(node_id, child_id, label=action_label, color=visit_hexcode, penwidth=f"{2 + width}")
                 _add_node(child, depth+1)
                 s += 1
 
     obs, rew, done, info = game._get_gamestate()
-    root_q, root_u = puct_scores
+    root_q, root_u = Q, U
     shifted_cards = [card % 13 for card in info['cards']]
     card_str = get_card_str(info['cards'])
     obs_str = get_obs_str(obs, 0)
     root_player = info['player']
-    root_actions = info['space']
     root_id = str(id(root))
     root_label = _get_label(root, get_player_dist=False)
     if nplayers == 2:
@@ -214,50 +226,61 @@ def print_tree(game, root, root_action_prob, root_value, puct_scores, maxdepth=3
     return dot
 
 class MCTS:
-    def __init__(self, obs, info, evalNN=None, *, hyperparams={}, verbose=False):
+    def __init__(self, obs, info, return_type, inference_session, *, hyperparams={}, verbose=False, debug=False):
+        self.debug=debug
+        self.root_info = copy.deepcopy(info)
+        self.root_obs = copy.deepcopy(obs)
+        self.root_player = info['player']
+        self.root_cards = info['cards'][:]
         self.nplayers = len(obs)
         self.root = Node(None, self.nplayers)
         self.root.generate_children()
-        self.player = info['player']
-        self.cards = info['cards'][:]
-        if verbose:
-            print(f"Loading MCTS with game:")
-            print(f"Obs: {obs}")
-            print(f"Info: {info}")
-            print(f"Set self.player to {self.player} ")
-            print(f"Set self.cards to {self.cards} ({get_card_str(self.cards)})")
-        self.game = FastTockGame(len(obs))
+        self.game = FastTockGame(len(obs), debug=self.debug)
         self.game.load_game(obs, info)
-        self.info = copy.deepcopy(info)
-        self.eval = evalNN
+        self.inference_session = inference_session
         self.cache = {}
+        self.lookups = 0
+        self.cache_hits = 0
         self.verbose = verbose
-        self.hyperparams = {
-                "epsilon": 0.25,
-                "alpha": .3,
-                "cpuct": 2,
-                "maxit": 50,
-        }
+        self.hyperparams = {}
+        self.return_type = return_type
+        if verbose:
+            print(f"Initialized MCTS")
+            print(f"Hyperparameters:")
         for key, value in hyperparams.items():
             self.hyperparams[key] = value
-        self.add_to_cache(obs, info, self.game.get_player_hash())
-
-
-    def _print(self, *args, **kwargs):
-        if self.verbose:
-            print(*args, **kwargs)
-
-    def get_child_indices(self, actionspace, cards):
-        return [(cards[card_idx] % 13) * 4+ pawn for (card_idx, pawn) in actionspace]
+            if verbose:
+                print(f"  {key}: {value}")
+        obs, rew, done, info = self.game._get_gamestate()
+        self.root_action_mask = info['space'][:]
+        self.root_hash = self.game.get_NN_hash()
+        self.root_value, self.root_action_prob = self.add_to_cache(obs, info, self.root_hash)
+        self.only_move = False
+        if len(self.root_action_prob) == 1:
+            self.only_move = True
+        if self.hyperparams["noise"]:
+            self.dirichlet_noise = np.random.dirichlet([self.hyperparams["alpha"]] * int(np.sum(info['space'])))
+            if verbose:
+                print(f"Dirichlet noise: {', '.join([f'{noise*100:.1f}%' for noise in self.dirichlet_noise])}")
+        else:
+            self.dirichlet_noise = None
+        if verbose:
+            self.game.print_visible()
+            print(f"Raw Network Policy and Value:")
+            print(f"Value head: ",  f'{self.root_value:.3f}' if self.nplayers == 2 else ', '.join([format(v, ':3f') for v in self.root_value]))
+            print_action_space(self.root_action_mask, action_probabilities=self.root_action_prob, check_normalization=True, print_delimiters=False)
 
     def get_puct_scores(self, child_s, child_n, parent_n, policy_heads, add_noise=False):
+        """
+        Return Q and U values that together make up the PUCT score for all
+        child nodes
+        """
         nactions = len(policy_heads)
         eps = self.hyperparams['epsilon']
         alpha = self.hyperparams['alpha']
         cpuct = self.hyperparams['cpuct']
-        if add_noise:
-            dirichlett_noise = np.random.dirichlet([alpha] * nactions)
-            policy = (1 - eps) * policy_heads + eps * dirichlett_noise
+        if add_noise and self.dirichlet_noise is not None:
+            policy = (1 - eps) * policy_heads + eps * self.dirichlet_noise
         else:
             policy = policy_heads
         q_value = child_s / (child_n + 1e-8)
@@ -269,102 +292,102 @@ class MCTS:
         return q_value, u_value
 
     def add_to_cache(self, obs, info, this_hash):
-        state = getstate(obs, info, gettorch=True)
-        self.eval.eval()
-        with torch.no_grad():
-            logits, value_head = self.eval(*state)
-            policy_head = torch.softmax(logits, dim=1)[0].detach().cpu().numpy()
-            if self.nplayers == 2:
-                value_head = value_head.item()
-            else:
-                value_head = torch.softmax(value_head, dim=1)[0].detach().cpu().numpy()
-
-        self.cache[this_hash] = policy_head, value_head
-        return policy_head, value_head
-
-
-    def traverse(self, node, action_space, cards):
-        # self._print(f"\nvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv")
-        # self._print(f"Traversing tree, now at node:\n{node}")
-        # self._print(self.game)
-        # self._print(f"Action space is {[get_action_string(action, cards) for action in action_space]}")
-        # self._print(f"{get_card_str(cards)}")
-        # compute policy heads for all children in advance (because batch advantage)
-        unique_action_space = get_unique_actions(action_space, cards)
-        # self._print(f"Unique space is {[get_action_string(u_act, cards) for u_act in unique_action_space]}")
-        # if not self.use_gpu_manager:
-        #     value_heads, child_indices = self.compute_child_policy_value(node, unique_action_space, cards)
-        # else:
-        #     child_indices = self.get_child_indices(action_space, cards)
-        #     child_indices.sort()
-        child_indices = self.get_child_indices(action_space, cards)
-        child_indices.sort()
-
-        # Traverse the tree
-        this_hash = self.game.get_player_hash()
-        if this_hash not in self.cache:
-            obs, rew, done, info = self.game._get_gamestate()
-            current_policy, current_value = self.add_to_cache(obs, info, this_hash)
-        else:
-            current_policy, current_value = self.cache[this_hash]
-
-        action_prob, action_mask, idx_order = get_action_prob(current_policy, {'space': unique_action_space, 'cards': cards}, return_mask = True)
-
+        """
+        Evaluate the neural network for a specific game state;
+        store the result in cache to save on computation
+        in case of later reference
+        """
+        self.lookups += 1
+        cards = info['cards']
+        state = getstate(obs, info, getdict=True)
+        # compute the policy and value evaluations
+        logits, value_head = self.inference_session.run(None, state)
+        logits = logits[0]
+        policy_head = np.exp(logits) / np.sum(np.exp(logits))
         if self.nplayers == 2:
-            Q, U = self.get_puct_scores(*node.get_child_s_n(action_mask), node.n, action_prob[idx_order], add_noise=(node.parent == None))
+            value_head = value_head.item()
         else:
-            s, n = node.get_child_s_n(action_mask)
-            Q, U = self.get_puct_scores(s, n.reshape(-1, 1), node.n, action_prob[idx_order], add_noise=(node.parent == None))
-
-        current_player = self.game.state[CURRENT_PLAYER]
-        if self.nplayers == 2:
-                puct_scores = self.get_relative_value(Q, current_player) + U
-                rel_idx = np.argmax(puct_scores)
-        else:
-            puct_scores = Q + U
-            rel_idx = np.argmax(puct_scores[:, current_player])
-        # # self._print(f"Got puct scores {puct_scores} for node")
-        # # self._print(node)
+            value_head = value_head[0]
+            value_head = np.exp(value_head) / np.sum(np.exp(value_head))
+        # Convert the 52 x 1 policy head to an array with action probabilities corresponding to the action space by masking and renormalizing
         try:
-            best_child_idx = child_indices[rel_idx]
-        except:
+            self.cache[this_hash] = value_head, policy_head[state['action_mask'][0].astype(bool)]
+        except Exception:
+            traceback.print_exc()
+            breakpoint()
+        return value_head, policy_head[state['action_mask'][0].astype(bool)]
+
+    def traverse(self, node, action_mask, cards):
+        """
+        Recursively traverse the tree of nodes from previous iterations
+        until ending up at a leave node to return its value
+        """
+        if self.debug:
+            print(f"Traversing tree from position:")
+            print(self.game)
+        try:
+            # get action space and list of indices of valid children from the current game state. Children that cannot be reached in one move are ignored.
+            child_indices = np.arange(50)[action_mask]
+            obs, rew, done, info = self.game._get_gamestate()
+
+            # get policy head (retrieve from cache if available)
+            this_hash = self.game.get_NN_hash()
+            if this_hash not in self.cache:
+                obs, rew, done, info = self.game._get_gamestate()
+                _, action_prob = self.add_to_cache(obs, info, this_hash)
+            else:
+                _, action_prob = self.cache[this_hash]
+                self.cache_hits += 1
+
+            # get PUCT scores of reachable child nodes
+            current_player = self.game.state[CURRENT_PLAYER]
+            if self.nplayers == 2:
+                Q, U = self.get_puct_scores(*node.get_child_s_n(action_mask), node.n, action_prob, add_noise=(node.parent == None))
+                puct_scores = self.get_relative_value(Q, current_player) + U
+            else:
+                s, n = node.get_child_s_n(action_mask)
+                Q, U = self.get_puct_scores(s, n.reshape(-1, 1), node.n, action_prob, add_noise=(node.parent == None))
+                puct_scores = Q[:, current_player] + U
+
+            # choose best child
+            best_idx = np.argmax(puct_scores)
+            best_action_number = child_indices[best_idx]
+            best_child = node.children[best_action_number]
+            obs, rew, done, info = self.game.step(best_action_number)
+            best_child.player_dist[info['player']] += 1
+
+            # check if node is a leaf node
+            if done:
+                if self.nplayers == 2:
+                    value = self.get_relative_value(1, info['winner'])
+                else:
+                    value = np.array([1 if i == info['winner'] else 0 for i in range(self.nplayers)])
+                return best_child, value
+            elif best_child.children == None:
+                best_child.generate_children()
+                child_game_hash = self.game.get_NN_hash()
+                if child_game_hash not in self.cache:
+                    value, _ = self.add_to_cache(obs, info, child_game_hash)
+                else:
+                    value, _ = self.cache[child_game_hash]
+                    self.cache_hits += 1
+                value = self.get_relative_value(value, info['player'])
+                return best_child, value
+
+            # node is not a leaf node; continue traversing
+            return self.traverse(best_child, info['space'], info['cards'])
+        except Exception as e:
+            print(f"Error: {e}")
+            self.game.print_visible()
+            print_action_space(action_mask)
+            print_cards(cards)
+            print(flush=True)
             traceback.print_exc()
             breakpoint()
 
-        best_child = node.children[best_child_idx]
-        pr_act = unique_action_space[np.argsort(idx_order)[rel_idx]]
-        # self._print(f"Chose best child {rel_idx}:{pr_act}")
-        # self._print(f"Corresponds to action {get_action_string(pr_act, cards)}")
-        obs, rew, done, info = self.game.step(pr_act)
-        best_child.player_dist[info['player']] += 1
-        if done:
-            if self.nplayers == 2:
-                value = self.get_relative_value(1, info['winner'])
-            else:
-                value = np.array([1 if i == info['winner'] else 0 for i in range(self.nplayers)])
-            # self._print(f"Child is terminal with value {value}")
-            return best_child, value
-        elif best_child.children == None:
-            if best_child.n == 0:
-                game_hash = self.game.get_player_hash()
-                if game_hash not in self.cache:
-                    policy, value = self.add_to_cache(obs, info, game_hash)
-                else:
-                    policy, value = self.cache[game_hash]
-                if self.nplayers == 2:
-                    value = self.get_relative_value(value, info['player'])
-                else:
-                    value = self.get_relative_value(value, info['player'])
-                # self._print(f"Child is a leaf and has n=0")
-                return best_child, value
-            else:
-                best_child.generate_children()
-                return self.traverse(best_child, info['space'], info['cards'])
-        return self.traverse(best_child, info['space'], info['cards'])
-
     def get_relative_value(self, value, player):
         if self.nplayers == 2:
-            if player == self.player:
+            if player == self.root_player:
                 return value
             else:
                 return -value
@@ -376,102 +399,124 @@ class MCTS:
                 return value.T[column_order].T
 
     def backpropagate(self, node, value):
-        # self._print("Backpropagating")
+        """
+        Update all nodes in the search path with the value
+        obtained at the leaf node by retracing the leaf node's
+        parent chain
+        """
+        if self.debug:
+            val_str = f"{value:.3f}" if self.nplayers == 2 else ", ".join([f'{value[i]:.3f}' for i in range(len(value))])
+            print_important(f"Backpropagating with value {val_str}")
         while node != None:
             node.n += 1
             node.s += value
             node = node.parent
-        self.game.rewind()
 
     def iterate(self):
-        for i in range(self.hyperparams['maxit']):
-            # self._print(f"Now doing iteration {i+1}")
-            self.game._shuffle()
-            self.game.deal(ncards=len(self.cards))
-            self.game.load_cards(self.player, self.cards[:])
-            # # self._print(self.game)
-            obs, rew, done, info = self.game._get_gamestate()
-            leaf, value = self.traverse(self.root, info['space'][:], info['cards'][:])
-            # try:
-            #     # self._print(f"Ended traversal at leaf (value={value:.3f}):\n{leaf}") 
-            # except:
-            #     print(f"Got value {value}, type {type(value)} (bad shape?)")
-            #     exit(1)
-            self.backpropagate(leaf, value)
+        """
+        Execute maxit iterations of MCTS
+        """
+        if self.only_move:
+            if self.verbose:
+                print(f"[!]: MCTS.iterate: not iterating because the position admits only one legal move")
+            return
+        with torch.no_grad():
+            for i in range(self.hyperparams['maxit']):
+                if self.debug:
+                    print_block(f"Starting iteration {i}")
+                self.game._shuffle()
+                self.game.deal(ncards=len(self.root_cards))
+                self.game.load_cards(self.root_player, self.root_cards[:])
+                leaf, value = self.traverse(self.root, self.root_action_mask[:], self.root_cards[:])
+                if self.debug:
+                    print(f"Ended traversal at node:")
+                    print(leaf)
+                self.backpropagate(leaf, value)
+                self.game.rewind()
 
-    def get_results(self, verbose=False):
-        obs, rew, done, info = self.game._get_gamestate()
-        actual_space = info['space'][:]
-        actual_cards = info['cards'][:]
-        mask = np.ones(52).astype(bool)
-        s, n = self.root.get_child_s_n(mask)
-        if self.nplayers != 2:
-            s = s[:,self.player]
-        val = s / (n + 1e-8)
-        prob = n / self.root.n
-        unique_actions = get_unique_actions(info['space'], info['cards'])
-        info['space'] = unique_actions
-        action_prob = get_action_prob(prob, info)
-        child_indices = self.get_child_indices(info['space'], info['cards'])
-        child_values = [val[child_indices[i]] for i in range(len(child_indices))]
-        if self.verbose or verbose:
-            self.root.print_children_and_self()
-            self.root.print_hot_path()
-            print_evals_and_info(info, np.vstack((action_prob, child_values)), f"MCTS results (player {info['player']}):\n" + self.game.__repr__() + f"\nAction Probabilities and Values: ", twoD_eval=True)
-        action_prob = get_action_prob(prob, info)
-        # breakpoint()
-        return action_prob, val
-
-    def save_tree(self, fname, maxdepth=2, max_branching=3):
-        obs, rew, done, info = self.game._get_gamestate()
-        
-        root_policy, root_val = self.cache[self.game.get_player_hash()]
-        action_space = info['space']
-        cards = info['cards']
-        unique_action_space = get_unique_actions(action_space, cards)
-        action_prob, action_mask, idx_order = get_action_prob(root_policy, {'space':unique_action_space, 'cards':cards}, return_mask = True)
-        ordered_action_prob = action_prob[idx_order]
-        if self.nplayers == 2:
-            puct_scores = self.get_puct_scores(*self.root.get_child_s_n(action_mask), self.root.n, ordered_action_prob)
+    def get_results(self):
+        """
+        Return the action probabilities and move valuations
+        Action probabilities are proportional visit counts and depend
+        only indirectly on move valuations
+        """
+        if self.verbose:
+            print(f"Returning MCTS results:")
+            print(f"    Evaluation lookups: {self.lookups}")
+            print(f"    Cache hit ratio: {self.cache_hits / (self.lookups + self.cache_hits) * 100:.1f}%")
+        if self.only_move:
+            action_probabilities = np.array([1])
+            action_values = np.array([self.root_value])
         else:
-            s, n = self.root.get_child_s_n(action_mask)
-            puct_scores = self.get_puct_scores(s, n.reshape(-1, 1), self.root.n, ordered_action_prob)
+            s, n = self.root.get_child_s_n(self.root_action_mask)
+            if self.nplayers != 2:
+                s = s[:,self.root_player]
+            action_values = s / (n + 1e-8)
+            action_probabilities = n / self.root.n
+        child_indices = np.arange(50)[self.root_action_mask]
 
-        dot = print_tree(self.game, self.root, ordered_action_prob, root_val, puct_scores, maxdepth, self.hyperparams['maxit'], max_branching=max_branching, root_player=self.player)
+        player_obs = self.root_obs[self.root_player]
+        return return_search_results(self.return_type, self.root_action_mask, player_obs, self.root_info, action_probabilities, verbose=self.verbose, check_normalization=True, tau=None, action_values=action_values)
+
+    def save_tree(self, fname, maxdepth=3, max_branching=2):
+        obs, rew, done, info = self.game._get_gamestate()
+        current_player = self.game.state[CURRENT_PLAYER]
+        if self.nplayers == 2:
+            Q, U = self.get_puct_scores(*self.root.get_child_s_n(self.root_action_mask), self.root.n, self.root_action_prob, add_noise=True)
+            puct_scores = self.get_relative_value(Q, current_player) + U
+        else:
+            s, n = self.root.get_child_s_n(self.root_action_mask)
+            Q, U = self.get_puct_scores(s, n.reshape(-1, 1), self.root.n, self.root_action_prob, add_noise=True)
+            puct_scores = Q[:, current_player] + U
+            Q = Q[:, current_player]
+        dot = print_tree(self.game, self.root, self.root_action_prob, self.root_value, self.root_action_mask, puct_scores, maxdepth, self.hyperparams['maxit'], max_branching=max_branching, root_player=self.root_player, dirichlet_noise=self.dirichlet_noise, Q=Q, U=U)
         dotfname = "temp.dot"
         dot.save(dotfname)
         dot.render(filename=dotfname, outfile=fname, cleanup=True)
 
-def main():
+def main(ort_info):
+    hyperparams = {"maxit": 1000, "cpuct": 2, "alpha": .2, "epsilon": .25, "noise": False}
     nplayers = 2
     game = make(nplayers)
     nw = PolicyNN(nplayers=nplayers)
-    nw.load("weights/two_player.pth", silent=True, device='cpu')
-    obs, done, rew, info = game._get_gamestate()
-    hyperparams = {"maxit": 400, "cpuct": 2}
-    move_no = 0
-    while not done:
-        try:
-            if nplayers == 2 and move_no > 10 or (nplayers == 4 and move_no > 60):
-                mcts = MCTS(obs, info, nw, hyperparams=hyperparams, verbose=True)
-                mcts.iterate()
-                mcts.save_tree(f"figures/mcts/mcts_tree_move-{move_no}.png")
-                prob, val = mcts.get_results(verbose=True)
-                move = info['space'][np.argmax(prob)]
-                temp = input("--------- Press Enter to Continue ---------")
-            # ts_player = TreeSearchPlayer(verbose=True, return_type="probabilities", alpha_beta_pruning = True, maxdepth=5)
-            else:
-                move = choice(info['space'])
+    # fname = "weights/2_players/session39best.pth"
 
-            # print(f"prob: {prob}\nval: {val}")
-            obs, rew, done, info= game.step(move)
-            move_no += 1
-        except Exception as e:
-            traceback.print_exc()
-            print(f"Error: {e}")
-            breakpoint()
+    fname = "weights/2_players/datasize_300005_epochs_10_batch_256_lr_0.001_iteration_1.pth"
+    # fname = "weights/session35best.pth"
+    nw.load(fname, silent=True)
+    sess = get_ort_inference_session(nw, fname, 0, *ort_info)
+    while True:
+        move_no = 0
+        obs, rew, done, info = game.reset()
+        while not done:
+            try:
+                if nplayers == 2 and move_no >= 0 or (nplayers == 4 and move_no > 60):
+                    mcts = MCTS(obs, info, "best_action", sess, hyperparams=hyperparams, verbose=True, debug=False)
+                    mcts.iterate()
+                    # mcts.save_tree(f"figures/mcts/mcts_tree.png")
+                    # mcts.save_tree(f"figures/mcts/mcts_tree_move_{move_no}.png")
+                    move = mcts.get_results()
+                    assert move in info['space']
+                    try:
+                        temp = input("--------- Press Enter to Continue ---------")
+                    except EOFError:
+                        print(f"\nInterrupting game")
+                        break
+
+                # ts_player = TreeSearchPlayer(verbose=True, return_type="probabilities", alpha_beta_pruning = True, maxdepth=5)
+                else:
+                    move = choice(info['space'])
+
+                # print(f"prob: {prob}\nval: {val}")
+                obs, rew, done, info= game.step(move)
+                move_no += 1
+            except Exception as e:
+                traceback.print_exc()
+                print(f"Error: {e}")
+                breakpoint()
 
 if __name__ == '__main__':
-    main()
+  from mp_ort_import import exec_main
+  exec_main(main)
 
     
